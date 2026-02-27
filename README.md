@@ -43,7 +43,8 @@ Designed for developers, QA engineers, and DevOps professionals who need to unde
 ---
 
 ## Screenshots
-<img width="1365" height="767" alt="Screenshot 2026-02-28 025214" src="https://github.com/user-attachments/assets/53be0903-394c-4d98-bd5a-15cfb8e3d770" />
+<img width="1365" height="767" alt="image" src="https://github.com/user-attachments/assets/f25f1613-c065-4372-8436-41e63176b7bd" />
+
 
 
 
