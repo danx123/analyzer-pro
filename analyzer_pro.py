@@ -1,3 +1,7 @@
+"""
+Analyzer Pro — Python Dynamic Performance Profiler
+Compatible with: source run, PyInstaller (--onefile/--windowed), Nuitka (--onefile/--windows-disable-console)
+"""
 import sys
 import os
 import subprocess
@@ -23,9 +27,121 @@ from PySide6.QtGui import (
 from PySide6.QtPrintSupport import QPrinter
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pipe reader helper (daemon thread)
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+#  FROZEN ENVIRONMENT DETECTION
+#  Resolves the correct Python interpreter regardless of how the app was built.
+#
+#  Problem (PyInstaller --windowed / Nuitka --onefile):
+#    sys.executable → path to the frozen .exe itself (analyzer_pro.exe)
+#    Calling [sys.executable, "script.py"] re-launches THE ANALYZER, not Python.
+#
+#  Solution:
+#    1. Check for ANALYZER_PYTHON env var (advanced user override).
+#    2. Walk sys.path entries for a real python[3][w].exe / python3 binary.
+#    3. Check common Windows install locations as a last resort.
+#    4. Fall back to shutil.which("python") / which("python3").
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _is_frozen() -> bool:
+    """True when running inside a PyInstaller or Nuitka bundle."""
+    return (
+        getattr(sys, "frozen", False)           # PyInstaller sets this
+        or "__compiled__" in dir(sys)           # Nuitka sets __compiled__
+        or hasattr(sys, "_MEIPASS")             # PyInstaller onefile temp dir
+    )
+
+
+def _find_python_executable() -> str:
+    """
+    Return an absolute path to a real Python interpreter suitable for
+    spawning subprocesses. Never returns the frozen bundle executable.
+    """
+    import shutil
+
+    # 1. Explicit user override via environment variable
+    override = os.environ.get("ANALYZER_PYTHON", "").strip()
+    if override and os.path.isfile(override):
+        return override
+
+    # 2. If NOT frozen, sys.executable is already the real Python
+    if not _is_frozen():
+        return sys.executable
+
+    # ── We are frozen — sys.executable is the .exe bundle, do NOT use it ──
+
+    # 3. Walk sys.path: PyInstaller/Nuitka may have left the real Python dir
+    #    in sys.path (e.g. the Scripts/ folder next to python.exe).
+    candidates = ["python.exe", "python3.exe", "python", "python3"]
+    for path_dir in sys.path:
+        if not path_dir or not os.path.isdir(path_dir):
+            continue
+        for name in candidates:
+            full = os.path.join(path_dir, name)
+            if os.path.isfile(full) and full != sys.executable:
+                return full
+        # Also check one level up (sys.path often has the Lib/ dir, not root)
+        parent = os.path.dirname(path_dir)
+        for name in candidates:
+            full = os.path.join(parent, name)
+            if os.path.isfile(full) and full != sys.executable:
+                return full
+
+    # 4. Check next to the frozen executable itself
+    exe_dir = os.path.dirname(sys.executable)
+    for name in candidates:
+        full = os.path.join(exe_dir, name)
+        if os.path.isfile(full) and full != sys.executable:
+            return full
+
+    # 5. Common Windows Python install directories
+    if sys.platform == "win32":
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        program_files = [
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            os.path.join(local_app, "Programs"),
+        ]
+        # Also check registry-style paths like C:\Python313\
+        drive = os.path.splitdrive(sys.executable)[0] or "C:"
+        for ver in ["313", "312", "311", "310", "39", "38"]:
+            program_files.append(os.path.join(drive + "\\", f"Python{ver}"))
+
+        for base in program_files:
+            if not base:
+                continue
+            # Direct match
+            for name in ["python.exe", "python3.exe"]:
+                full = os.path.join(base, name)
+                if os.path.isfile(full):
+                    return full
+            # Subdirs like Programs\Python\Python313\
+            try:
+                for sub in os.listdir(base):
+                    if sub.lower().startswith("python"):
+                        for name in ["python.exe", "python3.exe"]:
+                            full = os.path.join(base, sub, name)
+                            if os.path.isfile(full):
+                                return full
+            except (OSError, PermissionError):
+                pass
+
+    # 6. PATH lookup — last resort
+    for name in candidates:
+        found = shutil.which(name)
+        if found and os.path.isfile(found) and found != sys.executable:
+            return found
+
+    # Should never reach here; caller will show a meaningful error
+    return ""
+
+
+# Resolve once at import time
+PYTHON_EXECUTABLE = _find_python_executable()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Pipe reader helper (daemon thread)
+# ═════════════════════════════════════════════════════════════════════════════
 def _pipe_reader(stream, q, tag):
     try:
         for line in iter(stream.readline, ""):
@@ -36,9 +152,9 @@ def _pipe_reader(stream, q, tag):
         q.put((tag, None))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Background monitor thread
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+#  Background monitor thread
+# ═════════════════════════════════════════════════════════════════════════════
 class ProcessMonitorThread(QThread):
     stats_signal    = Signal(dict)
     finished_signal = Signal(dict)
@@ -46,10 +162,12 @@ class ProcessMonitorThread(QThread):
     stdout_signal   = Signal(str)
     stderr_signal   = Signal(str)
 
-    def __init__(self, script_path, extra_paths=None, extra_args=None, custom_cwd=None):
+    def __init__(self, script_path, python_exe,
+                 extra_paths=None, extra_args=None, custom_cwd=None):
         super().__init__()
         self.script_path   = os.path.abspath(script_path)
         self.script_dir    = os.path.dirname(self.script_path)
+        self.python_exe    = python_exe                        # resolved interpreter
         self.extra_paths   = extra_paths or []
         self.extra_args    = extra_args or []
         self.custom_cwd    = os.path.abspath(custom_cwd) if custom_cwd else self.script_dir
@@ -58,18 +176,31 @@ class ProcessMonitorThread(QThread):
         self.tracked_pids  = set()
         self._output_queue = queue.Queue()
 
-    # ── Build environment ────────────────────────────────────────────────────
+    # ── Build clean subprocess environment ───────────────────────────────────
     def _build_env(self):
         env = os.environ.copy()
 
-        # ★ FIX 1: Force UTF-8 I/O — prevents UnicodeEncodeError on Windows cp1252
-        env["PYTHONUTF8"]                  = "1"
-        env["PYTHONIOENCODING"]            = "utf-8"
-        env["PYTHONLEGACYWINDOWSSTDIO"]    = "0"
+        # Force UTF-8 everywhere — prevents UnicodeEncodeError on Windows cp1252
+        env["PYTHONUTF8"]               = "1"
+        env["PYTHONIOENCODING"]         = "utf-8"
+        env["PYTHONLEGACYWINDOWSSTDIO"] = "0"
 
+        # When frozen, os.environ may carry PYTHONPATH pointing INTO the bundle
+        # temp dir (_MEIPASS). Strip those poisoned entries out — they are
+        # irrelevant for the external Python interpreter we are about to spawn.
+        if _is_frozen():
+            meipass = getattr(sys, "_MEIPASS", None)
+            raw_pp  = env.get("PYTHONPATH", "")
+            clean   = [
+                p for p in raw_pp.split(os.pathsep)
+                if p and (meipass is None or not p.startswith(meipass))
+            ]
+            env["PYTHONPATH"] = os.pathsep.join(clean)
+
+        # Build PYTHONPATH from the project root
         paths = [self.script_dir, self.custom_cwd] + self.extra_paths
 
-        # ★ FIX 2: Auto-discover all sub-dirs containing .py files → full PYTHONPATH
+        # Auto-discover all sub-dirs that contain Python source files
         for root, dirs, files in os.walk(self.custom_cwd):
             dirs[:] = [
                 d for d in dirs
@@ -83,6 +214,7 @@ class ProcessMonitorThread(QThread):
             if any(f.endswith(".py") for f in files):
                 paths.append(root)
 
+        # De-duplicate, preserve order
         seen, unique = set(), []
         for p in paths:
             if p not in seen:
@@ -94,36 +226,62 @@ class ProcessMonitorThread(QThread):
         env["PYTHONPATH"] = f"{joined}{os.pathsep}{existing_pp}" if existing_pp else joined
         return env
 
-    # ── Main run loop ────────────────────────────────────────────────────────
+    # ── Main run loop ─────────────────────────────────────────────────────────
     def run(self):
         env = self._build_env()
-        # -u = unbuffered stdout/stderr (live output)
-        cmd = [sys.executable, "-u", self.script_path] + self.extra_args
+        # -u = unbuffered; use the resolved real Python, never sys.executable
+        cmd = [self.python_exe, "-u", self.script_path] + self.extra_args
 
-        self.log_signal.emit(f"CWD  ▸  {self.custom_cwd}")
-        self.log_signal.emit(f"CMD  ▸  {' '.join(cmd)}")
+        self.log_signal.emit(f"PYTHON ▸  {self.python_exe}")
+        self.log_signal.emit(f"CWD    ▸  {self.custom_cwd}")
+        self.log_signal.emit(f"CMD    ▸  {' '.join(cmd)}")
         pp = env.get("PYTHONPATH", "")
         self.log_signal.emit(
-            f"PYTHONPATH ▸  {pp[:300]}{'…' if len(pp) > 300 else ''}"
+            f"PYPATH ▸  {pp[:280]}{'…' if len(pp) > 280 else ''}"
         )
 
-        self.proc = subprocess.Popen(
-            cmd,
-            cwd=self.custom_cwd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",   # ★ FIX 3: read pipes as UTF-8
-            errors="replace",   # replace un-decodable bytes instead of crashing
-            bufsize=1,
-        )
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                cwd=self.custom_cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                # Windows: CREATE_NO_WINDOW prevents a flash console on --windowed builds
+                creationflags=(0x08000000 if sys.platform == "win32" else 0),
+            )
+        except FileNotFoundError:
+            self.finished_signal.emit({
+                "error":     f"Python interpreter not found: {self.python_exe}",
+                "exit_code": -1,
+                "zombies":   [],
+                "stdout":    "",
+                "stderr":    "",
+            })
+            return
+        except Exception as exc:
+            self.finished_signal.emit({
+                "error":     str(exc),
+                "exit_code": -1,
+                "zombies":   [],
+                "stdout":    "",
+                "stderr":    "",
+            })
+            return
 
         try:
             main_p = psutil.Process(self.proc.pid)
             self.tracked_pids.add(self.proc.pid)
         except psutil.NoSuchProcess:
-            self.finished_signal.emit({"status": "Failed to start"})
+            self.finished_signal.emit({
+                "error": "Process exited immediately after launch.",
+                "exit_code": self.proc.returncode,
+                "zombies": [], "stdout": "", "stderr": "",
+            })
             return
 
         t_out = threading.Thread(
@@ -143,16 +301,19 @@ class ProcessMonitorThread(QThread):
         done_out = done_err  = False
 
         while not (done_out and done_err):
+            # Drain all available items from the queue
             try:
                 while True:
                     tag, line = self._output_queue.get(timeout=0.05)
                     if tag == "out":
-                        if line is None: done_out = True
+                        if line is None:
+                            done_out = True
                         else:
                             out_lines.append(line)
                             self.stdout_signal.emit(line.rstrip("\n"))
                     else:
-                        if line is None: done_err = True
+                        if line is None:
+                            done_err = True
                         else:
                             err_lines.append(line)
                             self.stderr_signal.emit(line.rstrip("\n"))
@@ -162,6 +323,7 @@ class ProcessMonitorThread(QThread):
             if not self.is_running:
                 break
 
+            # Emit perf stats while the process is alive
             if self.proc.poll() is None:
                 try:
                     children      = main_p.children(recursive=True)
@@ -221,9 +383,9 @@ class ProcessMonitorThread(QThread):
                 pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Accent bar widget
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+#  Accent bar widget
+# ═════════════════════════════════════════════════════════════════════════════
 class AccentBar(QFrame):
     def __init__(self, c1="#00d4aa", c2="#60a5fa", parent=None):
         super().__init__(parent)
@@ -240,9 +402,9 @@ class AccentBar(QFrame):
         p.fillRect(self.rect(), QBrush(grad))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stat badge widget
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+#  Stat badge widget
+# ═════════════════════════════════════════════════════════════════════════════
 class StatBadge(QFrame):
     def __init__(self, label, unit, accent="#00d4aa", parent=None):
         super().__init__(parent)
@@ -267,11 +429,10 @@ class StatBadge(QFrame):
         self.value_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._accent = accent
         self.value_lbl.setStyleSheet(
-            f"color: {accent}; font-size: 18px; font-weight: 700; "
-            "font-family: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;"
+            f"color: {accent}; font-size: 18px; font-weight: 700;"
+            " font-family: 'JetBrains Mono','Cascadia Code','Consolas',monospace;"
             " background: transparent;"
         )
-
         layout.addLayout(left)
         layout.addWidget(self.value_lbl, 1)
 
@@ -279,15 +440,15 @@ class StatBadge(QFrame):
         self.value_lbl.setText(str(v))
         if color:
             self.value_lbl.setStyleSheet(
-                f"color: {color}; font-size: 18px; font-weight: 700; "
-                "font-family: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;"
+                f"color: {color}; font-size: 18px; font-weight: 700;"
+                " font-family: 'JetBrains Mono','Cascadia Code','Consolas',monospace;"
                 " background: transparent;"
             )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main window
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+#  Stylesheet
+# ═════════════════════════════════════════════════════════════════════════════
 STYLESHEET = """
     * { box-sizing: border-box; }
     QMainWindow, QWidget        { background: #0c0e18; color: #dde1ec; }
@@ -302,6 +463,7 @@ STYLESHEET = """
         font-size: 12px;
     }
     QLineEdit:focus     { border: 1px solid #00d4aa; }
+    QLineEdit:disabled  { background: #0d0f1a; color: #2d3148; }
 
     QPushButton {
         background: #181b2e;
@@ -347,7 +509,6 @@ STYLESHEET = """
         font-weight: 700;
         letter-spacing: 2px;
         color: #2e3555;
-        text-transform: uppercase;
     }
     QGroupBox::title {
         subcontrol-origin: margin;
@@ -361,7 +522,7 @@ STYLESHEET = """
         color: #b8c2d8;
         border: 1px solid #1c1f34;
         border-radius: 6px;
-        font-family: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
+        font-family: 'JetBrains Mono','Cascadia Code','Consolas',monospace;
         font-size: 11px;
         padding: 6px 8px;
         selection-background-color: #00d4aa30;
@@ -397,6 +558,9 @@ STYLESHEET = """
 """
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  Main window
+# ═════════════════════════════════════════════════════════════════════════════
 class AnalyzerApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -404,18 +568,52 @@ class AnalyzerApp(QMainWindow):
         self.resize(1280, 900)
         self.setMinimumSize(920, 660)
 
-        icon_path = "analyzer.ico"
-        if hasattr(sys, "_MEIPASS"):
-            icon_path = os.path.join(sys._MEIPASS, icon_path)
-        if os.path.exists(icon_path):
+        # Icon resolution — works for source, PyInstaller _MEIPASS, and Nuitka
+        icon_path = self._resolve_asset("analyzer.ico")
+        if icon_path:
             self.setWindowIcon(QIcon(icon_path))
 
         self.setStyleSheet(STYLESHEET)
         self.time_data, self.mem_data, self.cpu_data = [], [], []
         self.monitor_thread = None
+
+        # Current resolved Python executable (can be overridden by user)
+        self._python_exe = PYTHON_EXECUTABLE
+
         self._build_ui()
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
+        # Warn if no interpreter was found at startup
+        if not self._python_exe or not os.path.isfile(self._python_exe):
+            self._log(
+                "WARNING  ▸  Could not auto-detect a Python interpreter. "
+                "Please set one manually via the Python field above.",
+                "#fbbf24",
+            )
+        else:
+            self._log(f"PYTHON ▸  {self._python_exe}", "#3a3f5c")
+
+    @staticmethod
+    def _resolve_asset(filename: str) -> str:
+        """Find a bundled asset regardless of run mode."""
+        # 1. PyInstaller _MEIPASS temp dir
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            p = os.path.join(meipass, filename)
+            if os.path.isfile(p):
+                return p
+        # 2. Nuitka: assets are next to the executable
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        p = os.path.join(exe_dir, filename)
+        if os.path.isfile(p):
+            return p
+        # 3. Source run: same directory as this script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        p = os.path.join(script_dir, filename)
+        if os.path.isfile(p):
+            return p
+        return ""
+
+    # ── Label helper ─────────────────────────────────────────────────────────
     def _sec(self, text):
         lbl = QLabel(text.upper())
         lbl.setObjectName("sec")
@@ -443,9 +641,7 @@ class AnalyzerApp(QMainWindow):
         )
         sub = QLabel("  ·  Python Dynamic Performance Profiler")
         sub.setStyleSheet("color: #2e3555; font-size: 10px; letter-spacing: 0.5px;")
-        hdr.addWidget(t1)
-        hdr.addWidget(t2)
-        hdr.addWidget(sub)
+        hdr.addWidget(t1); hdr.addWidget(t2); hdr.addWidget(sub)
         hdr.addStretch()
         root.addLayout(hdr)
         root.addWidget(AccentBar("#00d4aa", "#60a5fa"))
@@ -457,9 +653,23 @@ class AnalyzerApp(QMainWindow):
         cfl.setSpacing(6)
         cfl.setContentsMargins(10, 16, 10, 8)
 
+        # Row 0: Python interpreter (critical for frozen builds)
+        r0 = QHBoxLayout(); r0.setSpacing(6)
+        r0.addWidget(self._sec("Python  "))
+        self.python_input = QLineEdit()
+        self.python_input.setText(self._python_exe)
+        self.python_input.setPlaceholderText(
+            "Path to python.exe / python3  (auto-detected) …"
+        )
+        self.python_input.textChanged.connect(self._on_python_changed)
+        btn_py = QPushButton("Browse"); btn_py.setFixedWidth(78)
+        btn_py.clicked.connect(self.browse_python)
+        r0.addWidget(self.python_input); r0.addWidget(btn_py)
+        cfl.addLayout(r0)
+
         # Row 1: Script
         r1 = QHBoxLayout(); r1.setSpacing(6)
-        r1.addWidget(self._sec("Script"))
+        r1.addWidget(self._sec("Script  "))
         self.file_input = QLineEdit()
         self.file_input.setPlaceholderText("Select Python entry-point  (*.py) …")
         btn_f = QPushButton("Browse"); btn_f.setFixedWidth(78)
@@ -487,7 +697,9 @@ class AnalyzerApp(QMainWindow):
         pc.addWidget(self._sec("Extra PYTHONPATH"))
         ep = QHBoxLayout(); ep.setSpacing(4)
         self.extra_path_input = QLineEdit()
-        self.extra_path_input.setPlaceholderText("Additional paths (auto-discovers by default) …")
+        self.extra_path_input.setPlaceholderText(
+            "Additional paths (auto-discovers by default) …"
+        )
         btn_ep = QPushButton("+"); btn_ep.setFixedWidth(30)
         btn_ep.clicked.connect(self.add_extra_path)
         ep.addWidget(self.extra_path_input); ep.addWidget(btn_ep)
@@ -496,7 +708,9 @@ class AnalyzerApp(QMainWindow):
         ac = QVBoxLayout(); ac.setSpacing(4)
         ac.addWidget(self._sec("Arguments"))
         self.args_input = QLineEdit()
-        self.args_input.setPlaceholderText("--debug  --port 8080  --config cfg.yaml …")
+        self.args_input.setPlaceholderText(
+            "--debug  --port 8080  --config cfg.yaml …"
+        )
         ac.addWidget(self.args_input)
 
         r3.addLayout(pc, 3); r3.addLayout(ac, 2)
@@ -507,20 +721,17 @@ class AnalyzerApp(QMainWindow):
         ar = QHBoxLayout(); ar.setSpacing(6)
         self.run_btn = QPushButton("▶  Run & Analyze")
         self.run_btn.setObjectName("run_btn")
-        self.run_btn.setFixedHeight(30)
-        self.run_btn.setFixedWidth(160)
+        self.run_btn.setFixedHeight(30); self.run_btn.setFixedWidth(160)
         self.run_btn.clicked.connect(self.start_analysis)
 
         self.stop_btn = QPushButton("■  Stop")
         self.stop_btn.setObjectName("stop_btn")
-        self.stop_btn.setFixedHeight(30)
-        self.stop_btn.setFixedWidth(90)
+        self.stop_btn.setFixedHeight(30); self.stop_btn.setFixedWidth(90)
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_analysis)
 
         btn_clr = QPushButton("Clear")
-        btn_clr.setFixedHeight(30)
-        btn_clr.setFixedWidth(64)
+        btn_clr.setFixedHeight(30); btn_clr.setFixedWidth(64)
         btn_clr.clicked.connect(self.clear_output)
 
         ar.addWidget(self.run_btn); ar.addWidget(self.stop_btn)
@@ -543,7 +754,7 @@ class AnalyzerApp(QMainWindow):
         # ── Splitter ──────────────────────────────────────────────────────────
         vs = QSplitter(Qt.Vertical); vs.setHandleWidth(4)
 
-        # Graphs — two plots side by side in a single GraphicsLayoutWidget
+        # Graphs — side by side
         gg = QGroupBox("Real-time Metrics")
         ggl = QVBoxLayout(gg); ggl.setContentsMargins(4, 16, 4, 4)
         pg.setConfigOptions(antialias=True, background="#07090f", foreground="#2e3555")
@@ -551,7 +762,6 @@ class AnalyzerApp(QMainWindow):
         self.gw.setBackground("#07090f")
         self.gw.setFixedHeight(170)
 
-        # Memory plot (left)
         self.plot_mem = self.gw.addPlot(row=0, col=0)
         self.plot_mem.showGrid(x=True, y=True, alpha=0.10)
         self.plot_mem.setLabel("left", "Memory MB", color="#c084fc", size="9pt")
@@ -559,13 +769,11 @@ class AnalyzerApp(QMainWindow):
         self.plot_mem.getAxis("bottom").setPen(pg.mkPen("#1c1f34"))
         self.plot_mem.getAxis("left").setTextPen(pg.mkPen("#3a3f5c"))
         self.plot_mem.getAxis("bottom").setTextPen(pg.mkPen("#3a3f5c"))
-        self.plot_mem.setContentsMargins(0, 0, 6, 0)
         self.curve_mem = self.plot_mem.plot(
             pen=pg.mkPen("#c084fc", width=1.5),
             fillLevel=0, brush=(192, 132, 252, 20),
         )
 
-        # CPU plot (right)
         self.plot_cpu = self.gw.addPlot(row=0, col=1)
         self.plot_cpu.showGrid(x=True, y=True, alpha=0.10)
         self.plot_cpu.setLabel("left", "CPU %", color="#fbbf24", size="9pt")
@@ -615,9 +823,22 @@ class AnalyzerApp(QMainWindow):
     def _toggle_cwd(self, state):
         self.cwd_input.setEnabled(state != Qt.Checked)
 
+    def _on_python_changed(self, text):
+        self._python_exe = text.strip()
+
+    def browse_python(self):
+        if sys.platform == "win32":
+            filt = "Python Executable (python.exe python3.exe);;All Files (*)"
+        else:
+            filt = "Python Executable (python python3);;All Files (*)"
+        p, _ = QFileDialog.getOpenFileName(self, "Select Python Interpreter", "", filt)
+        if p:
+            self._python_exe = p
+            self.python_input.setText(p)
+
     def browse_file(self):
         p, _ = QFileDialog.getOpenFileName(
-            self, "Select Entry-point", "", "Python Files (*.py)"
+            self, "Select Entry-point Script", "", "Python Files (*.py)"
         )
         if p:
             self.file_input.setText(p)
@@ -625,14 +846,18 @@ class AnalyzerApp(QMainWindow):
                 self.cwd_input.setText(os.path.dirname(p))
 
     def browse_dir(self):
-        p = QFileDialog.getExistingDirectory(self, "Select Working / Project Directory")
+        p = QFileDialog.getExistingDirectory(
+            self, "Select Working / Project Directory"
+        )
         if p:
             self.auto_cwd_chk.setChecked(False)
             self.cwd_input.setEnabled(True)
             self.cwd_input.setText(p)
 
     def add_extra_path(self):
-        p = QFileDialog.getExistingDirectory(self, "Add Extra PYTHONPATH Directory")
+        p = QFileDialog.getExistingDirectory(
+            self, "Add Extra PYTHONPATH Directory"
+        )
         if p:
             cur = self.extra_path_input.text().strip()
             sep = os.pathsep
@@ -660,13 +885,25 @@ class AnalyzerApp(QMainWindow):
         )
         self.stdout_area.moveCursor(QTextCursor.End)
 
-    # ── Analysis lifecycle ───────────────────────────────────────────────────
+    # ── Analysis lifecycle ────────────────────────────────────────────────────
     def start_analysis(self):
+        # Validate Python interpreter
+        python_exe = self.python_input.text().strip() or self._python_exe
+        if not python_exe or not os.path.isfile(python_exe):
+            self._log(
+                "ERROR  ▸  Python interpreter not found. "
+                "Please browse to python.exe manually.",
+                "#ef4444",
+            )
+            return
+
+        # Validate script
         script_path = self.file_input.text().strip()
         if not script_path or not os.path.exists(script_path):
             self._log("ERROR  ▸  Script file not found.", "#ef4444")
             return
 
+        # Working directory
         if self.auto_cwd_chk.isChecked() or not self.cwd_input.text().strip():
             cwd = os.path.dirname(os.path.abspath(script_path))
         else:
@@ -675,6 +912,7 @@ class AnalyzerApp(QMainWindow):
                 self._log(f"ERROR  ▸  Working directory not found: {cwd}", "#ef4444")
                 return
 
+        # Extra PYTHONPATH
         raw_extra = self.extra_path_input.text().strip()
         extra_paths = []
         if raw_extra:
@@ -683,9 +921,11 @@ class AnalyzerApp(QMainWindow):
                 if p and os.path.isdir(p):
                     extra_paths.append(p)
 
-        raw_args  = self.args_input.text().strip()
+        # Script arguments
+        raw_args   = self.args_input.text().strip()
         extra_args = shlex.split(raw_args) if raw_args else []
 
+        # Reset
         self.clear_output()
         self.time_data, self.mem_data, self.cpu_data = [], [], []
         self.curve_mem.setData([], []); self.curve_cpu.setData([], [])
@@ -702,6 +942,7 @@ class AnalyzerApp(QMainWindow):
 
         self.monitor_thread = ProcessMonitorThread(
             script_path,
+            python_exe=python_exe,
             extra_paths=extra_paths,
             extra_args=extra_args,
             custom_cwd=cwd,
@@ -732,6 +973,14 @@ class AnalyzerApp(QMainWindow):
     def _finish_analysis(self, result):
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+
+        # Surface any launch error prominently
+        if result.get("error"):
+            self._log(f"ERROR  ▸  {result['error']}", "#ef4444")
+            self.b_status.set_value("ERR", "#ef4444")
+            self._log("─" * 60, "#1c1f34")
+            return
+
         exit_code = result.get("exit_code")
         ok = exit_code == 0
         self.b_status.set_value("OK" if ok else "ERR",
@@ -751,7 +1000,7 @@ class AnalyzerApp(QMainWindow):
             self._log("No leaked / zombie processes detected.", "#00d4aa")
         self._log("─" * 60, "#1c1f34")
 
-    # ── Export ───────────────────────────────────────────────────────────────
+    # ── Export ────────────────────────────────────────────────────────────────
     def export_pdf(self):
         if not self.report_area.toPlainText().strip():
             self._log("WARNING  ▸  Nothing to export.", "#fbbf24"); return
@@ -788,9 +1037,21 @@ class AnalyzerApp(QMainWindow):
                 self._log(f"ERROR  ▸  {e}", "#ef4444")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+#  Entry point
+# ═════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    # Force UTF-8 for this process itself on Windows
+    # Nuitka: bootstrap multiprocessing support (must be first)
+    if "__compiled__" in dir(sys):
+        import multiprocessing
+        multiprocessing.freeze_support()
+
+    # PyInstaller: bootstrap multiprocessing support
+    if getattr(sys, "frozen", False):
+        import multiprocessing
+        multiprocessing.freeze_support()
+
+    # Force UTF-8 for the analyzer process itself on Windows
     if sys.platform == "win32":
         import io
         if hasattr(sys.stdout, "buffer"):
